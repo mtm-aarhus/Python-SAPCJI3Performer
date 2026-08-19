@@ -19,9 +19,11 @@ COLUMN_MAP: dict[str, str] = {
     'Bilagsnummer'              : 'Bilagsnummer',
     'BoL'                       : 'BoL',
     'PSP-element'               : 'PSPElement',
+    'OpV'                       : 'OpV',
     'beskrivelse'               : 'Beskrivelse',
     'Periode'                   : 'Periode',
     'Bogføringsdato'            : 'Bogfoeringsdato',
+    'FI-bogførLinie'            : 'FIBogfoeringslinie',
     'Medarbejders navn'         : 'MedarbejdersNavn',
     'Arbejdsplads tekst'        : 'ArbejdspladsTekst',
     'Modkontobetegnelse'        : 'Modkontobetegnelse',
@@ -36,7 +38,6 @@ COLUMN_MAP: dict[str, str] = {
     'Bilagstoptekst'            : 'Bilagstoptekst',
     'BME'                       : 'BME',
     'COVal'                     : 'COValuta',
-    'FIL'                       : 'FIL',
     'Fulde navn'                : 'FuldeNavn',
     'Funktionsområde'           : 'Funktionsomraade',
     'Kapitalmidler'             : 'Kapitalmidler',
@@ -88,9 +89,9 @@ STAGE_COLUMNS = ['Bilagsnummer', 'Position'] + [
     c for c in COLUMN_MAP.values() if c not in ('Bilagsnummer',)
 ]
 
-# dbo.CJI3_Stage columns are NVARCHAR(255). Longer values are truncated
-# rather than failing the whole batch; the count is logged so a shifted export
-# does not pass unnoticed.
+# dbo.CJI3_Stage columns are NVARCHAR(255). A longer value is a hard error, not a
+# truncation - see _to_stage_tuples. The widest value in a measured 25,049-row export
+# was 50 characters (Beskrivelse af modkontoen), so this has ample headroom.
 MAX_STAGE_LENGTH = 255
 
 
@@ -122,9 +123,16 @@ def load_spool_file(
 
     Returns the proc's row counts.
     """
-    _, rows = parse_spool_file(file_path)
+    _, rows, parse_warnings = parse_spool_file(file_path)
     if not rows:
         raise ValueError(f"No data rows found in spool export: {file_path}")
+
+    discarded = parse_warnings.get('discarded_continuation_lines', 0)
+    if discarded:
+        orchestrator_connection.log_info(
+            f"{discarded} row(s) had a misaligned continuation line; their TilbF/TbF/TFB/"
+            "User Name/Valoerdato columns were left empty. The main line loaded normally."
+        )
 
     _verify_headers(rows)
 

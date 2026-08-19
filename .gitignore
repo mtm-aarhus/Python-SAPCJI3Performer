@@ -163,3 +163,5 @@ uv.lock
 *.csv
 
 /sql
+# Diagnostic output from sandbox_layout.py (anonymised, but no need to version it)
+sandbox_output/
