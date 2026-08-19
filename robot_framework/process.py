@@ -3,15 +3,16 @@
 from OpenOrchestrator.orchestrator_connection.connection import OrchestratorConnection
 from OpenOrchestrator.database.queues import QueueElement
 
+import json
 import os
 import re
 import time
-from datetime import date, timedelta
-import uuid
 
 import win32com.client
 
-from robot_framework.spool_to_sql import upsert_to_sqlite
+from robot_framework import config
+from robot_framework import mssql_load
+from robot_framework.exceptions import BusinessError
 
 
 _SAP_LABEL_ID_PATTERN = re.compile(r"/lbl\[(\d+),(\d+)\]$")
@@ -22,7 +23,9 @@ _SAP_CHECKBOX_ID_PATTERN = re.compile(r"/chk\[(\d+),(\d+)\]$")
 def process(orchestrator_connection: OrchestratorConnection, queue_element: QueueElement | None = None) -> None:
     orchestrator_connection.log_trace("Running process.")
 
-    job_name = queue_element.data
+    job_name, udtraek_id = parse_queue_element(queue_element)
+    orchestrator_connection.log_trace(f"Spool job {job_name}, window {udtraek_id}.")
+
     session = get_sap_session(connection_index=0, session_index=0)
     wait_ready(session)
 
@@ -36,9 +39,45 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
     file_path = get_exported_file_path(spool_session)
     orchestrator_connection.log_trace(f"Spool exported to: {file_path}")
 
-    db_path = r"C:\Users\az60026\OneDrive - Aarhus kommune\PythonProjects\Python-SAPCJI3Performer\cji3_data.db"
-    count = upsert_to_sqlite(db_path=db_path, file_path=file_path)
-    orchestrator_connection.log_trace(f"Upserted {count} rows into SQLite.")
+    counts = mssql_load.load_spool_file(
+        orchestrator_connection,
+        file_path=file_path,
+        spool_job=job_name,
+        udtraek_id=udtraek_id,
+    )
+    orchestrator_connection.log_trace(
+        "Merged into CJI3: "
+        + ", ".join(f"{key}={value}" for key, value in counts.items())
+    )
+
+    if counts.get("Konverteringsadvarsler"):
+        orchestrator_connection.log_info(
+            f"{counts['Konverteringsadvarsler']} row(s) had a value that could not be "
+            "converted to date/number. Check the spool column layout."
+        )
+
+
+def parse_queue_element(queue_element: QueueElement) -> tuple[str, int | None]:
+    """
+    Read the spool job name and window id from a queue element.
+
+    The dispatcher writes {"SpoolJob": ..., "UdtraekId": ...}. Elements created
+    before the work list existed carry the bare prtxt as data, and are still
+    accepted - they just merge without closing a window.
+    """
+    data = (queue_element.data or "").strip()
+    if not data:
+        raise BusinessError("Queue element has no data; cannot tell which spool job to fetch.")
+
+    if not data.startswith("{"):
+        return data, None
+
+    payload = json.loads(data)
+    job_name = payload.get("SpoolJob")
+    if not job_name:
+        raise BusinessError(f"Queue element data has no SpoolJob: {data}")
+
+    return job_name, payload.get("UdtraekId")
 
 
 
@@ -51,18 +90,33 @@ def open_spool_overview(session) -> None:
     wait_ready(session)
 
 
-def wait_for_spool_job(session, job_name: str, timeout_s: int = 300, poll_interval_s: int = 10) -> int:
+def wait_for_spool_job(session, job_name: str, timeout_s: int | None = None, poll_interval_s: int | None = None) -> int:
     """
     Poll the spool overview until a spool job whose title contains job_name appears.
     Returns the row number of the matching job.
+
+    Raises BusinessError rather than TimeoutError on giving up. That is deliberate:
+    queue_framework only keeps the queue loop alive for BusinessError, so a
+    TimeoutError here would abandon every remaining queue element in the run - and
+    when the dispatcher has queued ten windows for the night, one slow spool job
+    would cost the other nine. The window itself is not lost: it stays IGang in
+    dbo.CJI3_Udtraek until the stale sweep in usp_CJI3_ReserverUdtraek
+    puts it back to Afventer, and the next dispatcher run submits it again.
     """
+    timeout_s = config.SPOOL_TIMEOUT_S if timeout_s is None else timeout_s
+    poll_interval_s = config.SPOOL_POLL_INTERVAL_S if poll_interval_s is None else poll_interval_s
+
     deadline = time.time() + timeout_s
     while True:
         row = _find_spool_job_row(session, job_name)
         if row is not None:
             return row
         if time.time() >= deadline:
-            raise TimeoutError(f"Spool job matching '{job_name}' not found within {timeout_s}s")
+            raise BusinessError(
+                f"Spool job matching '{job_name}' was not ready within {timeout_s}s. "
+                "Either SAP is still generating it, or the row is not on the visible "
+                "page of the spool overview."
+            )
         time.sleep(poll_interval_s)
         session.findById("wnd[0]/tbar[1]/btn[45]").press()  # Opdater (Ctrl+Shift+F9)
         wait_ready(session)
@@ -226,15 +280,3 @@ def wait_ready(session, timeout_s: int = 30) -> None:
         time.sleep(0.1)
 
 
-def danish_week_number(d: date) -> int:
-    """Danish week numbering is ISO week number."""
-    return d.isocalendar().week
-
-
-def build_prtxt(d: date) -> str:
-    """
-    prtxt format: YYYYMMDD + 'UGE' + weekno (Danish/ISO)
-    Example: 20260216UGE7
-    """
-    weekno = danish_week_number(d)
-    return f"{d:%Y%m%d}UGE{weekno}"

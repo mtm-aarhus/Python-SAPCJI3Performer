@@ -20,7 +20,8 @@ dependencies = [
     "Pillow == 10.*",
     "selenium == 4.40.0",
     "psutil == 7.2.2",
-    "pywin32 == 311"
+    "pywin32 == 311",
+    "pyodbc == 5.*"
 ]
 
 [project.optional-dependencies]

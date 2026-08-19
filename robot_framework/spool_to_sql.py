@@ -1,12 +1,10 @@
-"""Parse SAP spool tab-text export and upsert rows into a SQLite database."""
+"""Parse a SAP spool tab-text export into rows.
+
+Loading those rows into MSSQL lives in mssql_load.py. This module only reads
+the file and works out the column layout from the header line.
+"""
 
 import re
-import sqlite3
-
-
-def _sanitize(name: str) -> str:
-    """Convert an arbitrary string to a safe SQL identifier."""
-    return re.sub(r'[^a-zA-Z0-9_]', '_', name.strip()).strip('_') or 'col'
 
 
 def parse_spool_file(file_path: str) -> tuple[list[str], list[dict]]:
@@ -96,78 +94,3 @@ def parse_spool_file(file_path: str) -> tuple[list[str], list[dict]]:
         i += 1
 
     return all_col_names, rows
-
-
-def upsert_to_sqlite(
-    db_path: str,
-    file_path: str,
-    table_name: str = 'cji3_data',
-    key_cols: tuple[str, ...] = ('Bilagsnummer', 'BoL'),
-) -> int:
-    """
-    Parse *file_path* and upsert all rows into the SQLite database at *db_path*.
-
-    *key_cols* is the composite primary key used to decide insert vs. overwrite.
-    Change it here if the "position" column turns out to be something other than BoL.
-
-    Returns the number of rows processed.
-    """
-    columns, rows = parse_spool_file(file_path)
-    if not rows:
-        return 0
-
-    for k in key_cols:
-        if k not in columns:
-            raise ValueError(f"Key column '{k}' not found in file. Available: {columns}")
-
-    conn = sqlite3.connect(db_path)
-    try:
-        _ensure_table(conn, table_name, columns, key_cols)
-        _upsert_rows(conn, table_name, columns, rows)
-        conn.commit()
-    finally:
-        conn.close()
-
-    return len(rows)
-
-
-# ── internal helpers ──────────────────────────────────────────────────────────
-
-def _ensure_table(
-    conn: sqlite3.Connection,
-    table_name: str,
-    columns: list[str],
-    key_cols: tuple[str, ...],
-) -> None:
-    safe_table = _sanitize(table_name)
-    safe_cols = [_sanitize(c) for c in columns]
-    safe_keys = [_sanitize(k) for k in key_cols]
-
-    col_defs = ', '.join(f'"{c}" TEXT' for c in safe_cols)
-    pk_def = ', '.join(f'"{k}"' for k in safe_keys)
-    conn.execute(
-        f'CREATE TABLE IF NOT EXISTS "{safe_table}" ({col_defs}, PRIMARY KEY ({pk_def}))'
-    )
-
-    # Add columns that exist in the file but not yet in the table (schema evolution)
-    existing_cols = {row[1] for row in conn.execute(f'PRAGMA table_info("{safe_table}")')}
-    for col in safe_cols:
-        if col not in existing_cols:
-            conn.execute(f'ALTER TABLE "{safe_table}" ADD COLUMN "{col}" TEXT')
-
-
-def _upsert_rows(
-    conn: sqlite3.Connection,
-    table_name: str,
-    columns: list[str],
-    rows: list[dict],
-) -> None:
-    safe_table = _sanitize(table_name)
-    # Map original column name → sanitized SQL name
-    col_pairs = [(orig, _sanitize(orig)) for orig in columns]
-    safe_col_list = ', '.join(f'"{safe}" ' for _, safe in col_pairs)
-    placeholders = ', '.join('?' for _ in col_pairs)
-
-    sql = f'INSERT OR REPLACE INTO "{safe_table}" ({safe_col_list}) VALUES ({placeholders})'
-    data = [tuple(row.get(orig, '') for orig, _ in col_pairs) for row in rows]
-    conn.executemany(sql, data)
