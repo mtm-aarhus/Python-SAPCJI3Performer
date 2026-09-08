@@ -8,6 +8,7 @@ import os
 import re
 import time
 
+import pywintypes
 import win32com.client
 
 from robot_framework import config
@@ -35,7 +36,7 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
 
     row = wait_for_spool_job(spool_session, job_name)
     select_spool_job(spool_session, row)
-    export_spool_as_tabtext(spool_session)
+    export_spool_as_text(spool_session)
     file_path = get_exported_file_path(spool_session)
     orchestrator_connection.log_trace(f"Spool exported to: {file_path}")
 
@@ -107,19 +108,43 @@ def wait_for_spool_job(session, job_name: str, timeout_s: int | None = None, pol
     poll_interval_s = config.SPOOL_POLL_INTERVAL_S if poll_interval_s is None else poll_interval_s
 
     deadline = time.time() + timeout_s
+    com_errors = 0          # consecutive; reset on any successful read
+    total_com_errors = 0
+
     while True:
-        row = _find_spool_job_row(session, job_name)
+        try:
+            row = _find_spool_job_row(session, job_name)
+            com_errors = 0
+        except pywintypes.com_error as error:
+            # SAP answers E_PENDING while it is busy with a server round-trip, which is
+            # a "not yet", not a failure. Seen in practice after ~22 minutes of polling,
+            # where it aborted the whole run. Only a long unbroken streak is fatal.
+            com_errors += 1
+            total_com_errors += 1
+            if com_errors >= config.SPOOL_MAX_CONSECUTIVE_COM_ERRORS:
+                raise BusinessError(
+                    f"SAP GUI has refused to be read {com_errors} times in a row while "
+                    f"waiting for spool job '{job_name}': {error}. The session looks "
+                    "wedged rather than busy."
+                ) from error
+            row = None
+
         if row is not None:
             return row
+
         if time.time() >= deadline:
             raise BusinessError(
-                f"Spool job matching '{job_name}' was not ready within {timeout_s}s. "
-                "Either SAP is still generating it, or the row is not on the visible "
-                "page of the spool overview."
+                f"Spool job matching '{job_name}' was not ready within {timeout_s}s "
+                f"({total_com_errors} transient SAP read error(s) along the way). Either "
+                "SAP is still generating it, or the row is not on the visible page of "
+                "the spool overview."
             )
-        time.sleep(poll_interval_s)
+
         session.findById("wnd[0]/tbar[1]/btn[45]").press()  # Opdater (Ctrl+Shift+F9)
         wait_ready(session)
+        # Sleep AFTER the refresh, not before: it paces the polling and gives SAP time
+        # to finish repainting before the next read, which is when E_PENDING appears.
+        time.sleep(poll_interval_s)
 
 
 def _find_spool_job_row(session, job_name: str) -> int | None:
@@ -214,9 +239,22 @@ def _get_spool_row_checkbox_id(session, row: int) -> str:
     return checkbox_id
 
 
-def export_spool_as_tabtext(session) -> None:
-    """Export the selected spool job as tab-separated text via Spooljob > Videresend > Tekst med tabulatorer."""
-    session.findById("wnd[0]/mbar/menu[0]/menu[2]/menu[3]").select()
+def export_spool_as_text(session) -> None:
+    """
+    Export the selected spool job via Spooljob > Videresend > 'Eksporter som tekst'.
+
+    menu[1], NOT menu[3]. menu[3] is 'Tekst med tabulator', which was used originally
+    and produces a file that cannot be parsed reliably: it puts a tab at each print
+    column boundary, so a cell that does not fill its column changes the tab count and
+    shifts every later value on the row. On one real 17,014-row export that corrupted
+    75.7% of rows. menu[1] writes pipe-delimited fixed-width text instead, which parsed
+    with zero bad values on the same data. See spool_to_sql for the detail.
+
+    Despite the ellipsis in the menu entry it opens no dialog - it writes the file
+    straight away and reports the path in the status bar, exactly as menu[3] did, so
+    get_exported_file_path is unchanged.
+    """
+    session.findById("wnd[0]/mbar/menu[0]/menu[2]/menu[1]").select()
     wait_ready(session)
 
 

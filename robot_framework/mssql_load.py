@@ -81,9 +81,22 @@ COLUMN_MAP: dict[str, str] = {
     'Valørdato'                 : 'Valoerdato',
 }
 
-# The business key. Position is not confirmed by Oekonomi yet, so it is fed from
-# BoL for now - change this one line when they decide, nothing else moves.
-POSITION_SOURCE = 'BoL'
+# Second half of the business key, Bilagsnummer + Position.
+#
+# OpV, established from a real 17,014-row export:
+#   Bilagsnummer + OpV  -> 17,014 distinct keys, 0 duplicates
+#   Bilagsnummer + BoL  -> 17,002, and BoL is EMPTY on 61% of rows
+#   Bilagsnummer alone  -> 13,729
+#
+# BoL was the original guess and it fails badly. The extract mixes two kinds of row:
+# FI postings, which carry BoL, Modkonto, BilArt and FI-bogforLinie (38.7%), and CO
+# allocations, which carry Medarbejders navn, MA-nr. and the Partner* columns instead
+# (61.3%). BoL only exists on the FI half, so keying on it rejected 10,426 rows for
+# having no key at all. OpV is filled on every row, is always numeric, runs 1..201, and
+# the largest document has exactly 201 rows - it numbers the lines within a document.
+#
+# Confirmed by Oekonomi: OpV rather than BoL is correct. Changing it is this one line.
+POSITION_SOURCE = 'OpV'
 
 STAGE_COLUMNS = ['Bilagsnummer', 'Position'] + [
     c for c in COLUMN_MAP.values() if c not in ('Bilagsnummer',)
@@ -127,11 +140,19 @@ def load_spool_file(
     if not rows:
         raise ValueError(f"No data rows found in spool export: {file_path}")
 
-    discarded = parse_warnings.get('discarded_continuation_lines', 0)
-    if discarded:
+    embedded = parse_warnings.get('rows_with_embedded_pipe', 0)
+    if embedded:
         orchestrator_connection.log_info(
-            f"{discarded} row(s) had a misaligned continuation line; their TilbF/TbF/TFB/"
-            "User Name/Valoerdato columns were left empty. The main line loaded normally."
+            f"{embedded} row(s) contained a '|' inside a value. Harmless - the parser "
+            "slices by column offset, not by splitting on the delimiter - but logged "
+            "because it would corrupt the row under a naive split."
+        )
+
+    orphaned = parse_warnings.get('rows_without_continuation', 0)
+    if orphaned:
+        orchestrator_connection.log_info(
+            f"{orphaned} row(s) had no continuation line, so their TilbF-Ref./TilbF-Org./"
+            "TbF/TFB/User Name/Valoerdato columns are empty. The main line loaded normally."
         )
 
     _verify_headers(rows)
@@ -156,8 +177,8 @@ def load_spool_file(
             cursor.executemany(insert_sql, tuples[start:start + config.STAGE_CHUNK_SIZE])
 
         cursor.execute(
-            "{CALL dbo.usp_CJI3_Merge (?, ?, ?, ?)}",
-            batch_id, spool_job, file_path, udtraek_id,
+            "{CALL dbo.usp_CJI3_Merge (?, ?, ?)}",
+            batch_id, spool_job, udtraek_id,
         )
         counts = dict(zip([c[0] for c in cursor.description], cursor.fetchone()))
 

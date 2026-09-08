@@ -24,6 +24,13 @@ dependencies = [
     "pyodbc == 5.*"
 ]
 
+# Without this, setuptools uses flat-layout auto-discovery and treats EVERY top-level
+# directory as a candidate package. Adding sql/ and sandbox_output/ to this repo made it
+# find three and refuse to build, which breaks `uv run python -m robot_framework` - i.e.
+# the robot itself, not just tooling. Naming the package removes the guesswork.
+[tool.setuptools]
+packages = ["robot_framework"]
+
 [project.optional-dependencies]
 dev = [
   "pylint",

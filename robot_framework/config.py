@@ -30,14 +30,26 @@ MAX_TASK_COUNT = 100
 # SAP spool
 # ----------------------
 
-# How long to wait for SAP to finish generating a spool job. Generation has been
-# observed to take up to 10 minutes for a week of data, so this is set well above
-# that - the robot polls and returns as soon as the job is ready, so a high
-# ceiling costs nothing on a normal run.
-SPOOL_TIMEOUT_S = 1800
+# How long to wait for SAP to finish generating a spool job.
+#
+# Measured from SM37: report RKPEP003 finishes a full week in 320-445 seconds, so ~7
+# minutes is normal and 30 gives ample headroom. An earlier 22-minute wait was NOT slow
+# generation - the background job had finished in 7 minutes and produced no spool at
+# all, so the robot was polling for something that would never appear. Since that is
+# the case this ceiling actually bounds, keep it modest: during an 85-window backfill,
+# every window with no data costs this long before it gives up.
+SPOOL_TIMEOUT_S = 1800          # 30 minutes
 
-# How often to refresh the spool overview while waiting.
+# How often to refresh the spool overview while waiting. Doubles as the settle pause
+# after each refresh, before the screen is read again.
 SPOOL_POLL_INTERVAL_S = 15
+
+# SAP GUI scripting raises E_PENDING (0x8000000A, "the data required is not yet
+# available") when a control is read while SAP is mid round-trip. It means "not yet",
+# not "broken", so those are retried rather than failing the run. This caps how many
+# CONSECUTIVE ones are tolerated, so a genuinely wedged session still gives up:
+# 20 x SPOOL_POLL_INTERVAL_S = 5 minutes of nothing but errors.
+SPOOL_MAX_CONSECUTIVE_COM_ERRORS = 20
 
 # ----------------------
 

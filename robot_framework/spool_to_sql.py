@@ -1,242 +1,200 @@
-"""Parse a SAP spool tab-text export into rows.
+"""Parse a SAP spool text export into rows.
 
 Loading those rows into MSSQL lives in mssql_load.py. This module only reads the file
 and works out which value belongs to which column.
 
-WHY THIS IS NOT A PLAIN SPLIT ON TABS
--------------------------------------
-The export is a printed classic ABAP list converted to text, not a data file. Two
-consequences, both measured against a real 25,049-row export:
+THE FORMAT, AND WHY IT IS THIS ONE
+----------------------------------
+The robot exports via Spooljob > Videresend > 'Eksporter som tekst', which writes the
+printed list as pipe-delimited, space-padded fixed-width text:
 
-  1. Records wrap onto a second physical line, which carries its own sub-header
-     (TilbF-Ref., TbF, TFB, User Name, Valoerdato).
+    |Bilagsnummer  |BoL|PSP-element        |OpV|beskrivelse
+    |220144606     |  1|XA-1391100000-00020|  1|Sikring af bygning
 
-  2. Data lines do not all carry the same number of tab fields. That export had six
-     different field counts (20, 21, 65, 66, 67, 68) against a 68-field header, and the
-     count does NOT tell you the alignment: rows of length 66 and 67 appear with both
-     offsets. Reading fields straight off the header index therefore put the right value
-     in the wrong column for 83.5% of rows - Periode, Bogfoeringsdato, Registr., Kl. and
-     Aar were correct in only ~17% of them.
+Each record spans two physical lines: a long main line and a short continuation line
+carrying TilbF-Ref., TilbF-Org., TbF, TFB, User Name and Valoerdato.
 
-     Every row resolves to an offset of either 0 or 1, and the offset applies only from
-     SHIFT_ANCHOR_COLUMN onwards; the leading columns (Bilagsnummer, BoL, PSP-element)
-     are never shifted. Detecting the offset per row from two independent anchor columns
-     put all nine spot-checked columns at 100% across all 25,049 rows.
+The obvious alternative, 'Tekst med tabulator', was tried first and does not work. It
+places a tab at each print column boundary, so a cell that does not fill its column
+changes the tab count and every later value on that row shifts. Measured against one
+real 17,014-row export: seven different field counts across rows, and 12,872 rows
+(75.7%) with a value that could not be converted - dates landing in Periode, quantities
+in Aar, and so on. No per-row offset can repair it, because the drift accumulates as you
+move along the row.
 
-So each row's offset is detected, not assumed, and a row whose offset cannot be
-established raises rather than being silently mis-parsed.
+The same export read as pipe-delimited fixed-width: 61 fields on every row, and ZERO
+bad values across nine typed columns and all 17,013 rows.
+
+WHY SLICE BY OFFSET RATHER THAN SPLIT ON '|'
+Three rows in that export contained a literal '|' inside a text value, which split()
+turns into 63 fields instead of 61 and shifts the row. Slicing at the header's pipe
+positions treats a stray pipe as just another character inside its column, and those
+three rows parse correctly. Offsets are also what makes the format trustworthy in the
+first place: they come from the printed layout, not from the data.
 """
 
 import re
 
-# Columns used to detect a row's offset. Both must agree, which is what makes the
-# detection trustworthy: a date alone could be matched by several columns, but a date
-# with a 1-2 digit period immediately to its left is unambiguous in this layout.
-ANCHOR_DATE_COLUMN = 'Bogføringsdato'
-ANCHOR_PERIOD_COLUMN = 'Periode'
-
-# Offsets to try, in order of preference.
-CANDIDATE_OFFSETS = (0, 1)
-
-_DATE = re.compile(r'\d{2}\.\d{2}\.\d{4}')
-_PERIOD = re.compile(r'\d{1,2}')
 _DIGITS = re.compile(r'\d+')
-
-# Single-character flag columns on the continuation line. They are the cheap way to tell
-# that a continuation line is misaligned - see _continuation_is_plausible.
-SUB_FLAG_COLUMNS = ('TbF', 'TFB')
-SUB_FLAG_MAX_LENGTH = 1
 
 
 def parse_spool_file(file_path: str) -> tuple[list[str], list[dict], dict[str, int]]:
     """
-    Parse a multi-section SAP spool tab-text export.
+    Parse a SAP spool text export.
 
     Returns (column_names, rows, warnings):
-      column_names - every column found, main line then continuation line
-      rows         - one dict per record, keyed by the column name as it appears in the
-                     header with SAP's right-alignment padding stripped
-                     ('    Periode' -> 'Periode')
-      warnings     - counts the caller should log; currently
-                     'discarded_continuation_lines'
+      column_names - main-line columns then continuation-line columns
+      rows         - one dict per record, keyed by the column name from the header
+      warnings     - counts worth logging: 'rows_with_embedded_pipe',
+                     'rows_without_continuation'
     """
     with open(file_path, encoding='cp1252', errors='replace') as handle:
         raw_lines = [line.rstrip('\r\n') for line in handle]
 
-    warnings = {'discarded_continuation_lines': 0}
+    warnings = {'rows_with_embedded_pipe': 0, 'rows_without_continuation': 0}
 
     header_indices = [i for i, line in enumerate(raw_lines) if _is_header_line(line)]
     if not header_indices:
         return [], [], warnings
 
     first = header_indices[0]
-    main_headers = [h.strip() for h in raw_lines[first].split('\t')]
-    sub_headers = ([h.strip() for h in raw_lines[first + 1].split('\t')]
-                   if first + 1 < len(raw_lines) else [])
+    main_ranges = _column_ranges(raw_lines[first])
+    main_names = _slice_all(raw_lines[first], main_ranges)
 
-    main_col_map = _name_to_index(main_headers)
-    sub_col_map = _name_to_index(sub_headers)
+    # The continuation sub-header is the line straight after the main header. Unlike the
+    # main lines it does not start with a pipe, and it is SHORTER than its own data rows
+    # - which is why the final column has to run to the end of the line being sliced
+    # rather than to the end of the header.
+    sub_ranges: list[tuple[int, int | None]] = []
+    sub_names: list[str] = []
+    if first + 1 < len(raw_lines):
+        candidate = raw_lines[first + 1]
+        if '|' in candidate and not _is_separator_line(candidate):
+            sub_ranges = _column_ranges(candidate)
+            sub_names = _slice_all(candidate, sub_ranges)
 
-    if 'Bilagsnummer' not in main_col_map:
-        raise ValueError("Column 'Bilagsnummer' not found in file header")
-    for required in (ANCHOR_DATE_COLUMN, ANCHOR_PERIOD_COLUMN):
-        if required not in main_col_map:
-            raise ValueError(
-                f"Anchor column {required!r} not found in file header, so a row's "
-                f"column offset cannot be established. Header: {main_headers}"
-            )
+    # A genuine continuation line carries pipes at exactly the offsets the sub-header
+    # defines. This is the test that keeps page furniture out: the export repeats a page
+    # header and footer every 64 lines, and one of those footers follows a record's main
+    # line, so a looser "next line that is not a record" test adopts it as the
+    # continuation. That put 748 characters of footer into Valoerdato.
+    sub_bars = set(_bar_positions(raw_lines[first + 1])) if sub_ranges else set()
 
-    bilag_idx = main_col_map['Bilagsnummer']
-    date_idx = main_col_map[ANCHOR_DATE_COLUMN]
-    period_idx = main_col_map[ANCHOR_PERIOD_COLUMN]
-    shift_from = _shift_boundary(main_headers)
+    main_map = {name: i for i, name in enumerate(main_names) if name}
+    sub_map = {name: i for i, name in enumerate(sub_names)
+               if name and name not in main_map}
 
-    all_col_names = list(main_col_map) + [k for k in sub_col_map if k not in main_col_map]
+    if 'Bilagsnummer' not in main_map:
+        raise ValueError(
+            f"Column 'Bilagsnummer' not found in the header. Columns: {main_names}"
+        )
+    bilag_idx = main_map['Bilagsnummer']
+
+    all_names = list(main_map) + list(sub_map)
+    header_bars = _bar_positions(raw_lines[first])
 
     rows: list[dict] = []
     index = 0
     while index < len(raw_lines):
         line = raw_lines[index]
-        fields = line.split('\t')
 
-        if _is_header_line(line):
-            index += 2               # skip the header and its sub-header
+        if _is_header_line(line) or _is_separator_line(line):
+            index += 1
             continue
 
-        if _is_data_line(fields, bilag_idx):
-            offset = _detect_offset(fields, date_idx, period_idx)
-            if offset is None:
-                raise ValueError(
-                    f"Could not establish the column offset for the row on line "
-                    f"{index + 1}: no candidate offset puts a date in "
-                    f"{ANCHOR_DATE_COLUMN!r} and a period in {ANCHOR_PERIOD_COLUMN!r}. "
-                    "The spool layout has probably changed."
-                )
+        fields = _slice_all(line, main_ranges)
+        if not _is_data_row(fields, bilag_idx):
+            index += 1
+            continue
 
-            row = {
-                name: _field(fields, idx, offset, shift_from)
-                for name, idx in main_col_map.items()
-            }
+        if _bar_positions(line) != header_bars:
+            # A '|' inside a value. Harmless here - offset slicing ignores it - but
+            # worth counting, since it would corrupt the row under split('|').
+            warnings['rows_with_embedded_pipe'] += 1
 
-            # The continuation line, if the next line is neither a new record nor a
-            # header. It is read positionally - unlike the main line it has no usable
-            # anchor, because Valoerdato is empty on 83% of rows and so cannot identify
-            # an offset - and then sanity-checked before being trusted.
-            if index + 1 < len(raw_lines):
-                nxt = raw_lines[index + 1]
-                nxt_fields = nxt.split('\t')
-                if (nxt.strip()
-                        and not _is_data_line(nxt_fields, bilag_idx)
-                        and not _is_header_line(nxt)):
-                    extra = {
-                        name: (nxt_fields[idx].strip() if idx < len(nxt_fields) else '')
-                        for name, idx in sub_col_map.items()
-                        if name not in main_col_map
-                    }
-                    if _continuation_is_plausible(extra):
-                        row.update(extra)
-                    else:
-                        warnings['discarded_continuation_lines'] += 1
-                    index += 1
+        row = {name: fields[i] for name, i in main_map.items()}
 
-            for name in all_col_names:
-                row.setdefault(name, '')
+        # Continuation line: the next line, when its pipes line up with the sub-header's.
+        got_continuation = False
+        if sub_ranges and index + 1 < len(raw_lines):
+            nxt = raw_lines[index + 1]
+            if (nxt.strip()
+                    and sub_bars.issubset(_bar_positions(nxt))
+                    and not _is_header_line(nxt)
+                    and not _is_separator_line(nxt)
+                    and not _is_data_row(_slice_all(nxt, main_ranges), bilag_idx)):
+                extra = _slice_all(nxt, sub_ranges)
+                for name, i in sub_map.items():
+                    row[name] = extra[i] if i < len(extra) else ''
+                got_continuation = True
+                index += 1
 
-            rows.append(row)
+        if not got_continuation:
+            warnings['rows_without_continuation'] += 1
 
+        for name in all_names:
+            row.setdefault(name, '')
+
+        rows.append(row)
         index += 1
 
-    return all_col_names, rows, warnings
+    return all_names, rows, warnings
 
 
 # ── internal helpers ──────────────────────────────────────────────────────────
 
-def _is_header_line(line: str) -> bool:
-    return 'Bilagsnummer' in [f.strip() for f in line.split('\t')]
+def _bar_positions(line: str) -> list[int]:
+    return [i for i, char in enumerate(line) if char == '|']
 
 
-def _is_data_line(fields: list[str], bilag_idx: int) -> bool:
-    """A data line has a purely numeric document number in the Bilagsnummer slot.
-
-    Bilagsnummer sits before the shifted region, so this test needs no offset.
+def _column_ranges(header_line: str) -> list[tuple[int, int | None]]:
     """
+    Character range of each column, derived from the pipes in a header line.
+
+    Main header lines both start and end with a pipe, so the columns are simply the
+    gaps between consecutive pipes. The continuation sub-header starts with text, so
+    the start of the line is a boundary too.
+
+    The final range ends at None, meaning 'to the end of whatever line is sliced'. That
+    is not cosmetic: the sub-header is 50 characters but its data rows are 52, so a
+    range taken from the header would cut the last two characters off Valoerdato.
+    """
+    bars = _bar_positions(header_line)
+    if not bars:
+        return []
+
+    edges = ([-1] if bars[0] != 0 else []) + bars
+    ranges: list[tuple[int, int | None]] = [
+        (a + 1, b) for a, b in zip(edges, edges[1:])
+    ]
+    last_start = edges[-1] + 1
+    if last_start < len(header_line):
+        ranges.append((last_start, None))
+    elif ranges:
+        ranges[-1] = (ranges[-1][0], None)
+    return ranges
+
+
+def _slice_all(line: str, ranges: list[tuple[int, int | None]]) -> list[str]:
+    """Slice a line into its columns. A trailing pipe is not part of the last value."""
+    out = []
+    for start, end in ranges:
+        piece = line[start:] if end is None else line[start:end]
+        out.append(piece.strip().rstrip('|').strip() if end is None else piece.strip())
+    return out
+
+
+def _is_header_line(line: str) -> bool:
+    return 'Bilagsnummer' in line
+
+
+def _is_separator_line(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped) and set(stripped) <= {'-', '|', '=', ' '} and '-' in stripped
+
+
+def _is_data_row(fields: list[str], bilag_idx: int) -> bool:
+    """A record's main line carries a purely numeric document number."""
     if bilag_idx >= len(fields):
         return False
-    return bool(_DIGITS.fullmatch(fields[bilag_idx].strip()))
-
-
-def _name_to_index(headers: list[str]) -> dict[str, int]:
-    """
-    Map header name to field index, first occurrence winning.
-
-    Duplicates are real: this layout repeats 'BoL' and 'OAr'. Keeping the first is
-    deliberate - the first 'BoL' is the line item number the business key uses - but it
-    does mean the later duplicate is unreachable. Widen this if one is ever needed.
-    """
-    mapping: dict[str, int] = {}
-    for idx, name in enumerate(headers):
-        if name:
-            mapping.setdefault(name, idx)
-    return mapping
-
-
-def _shift_boundary(headers: list[str]) -> int:
-    """
-    First field index affected by a row's offset.
-
-    The header carries a run of empty cells between the leading columns and the rest
-    (indices 5-11 in the observed layout). Rows that omit one of those columns shift
-    everything after the run, while the leading columns stay put. The boundary is
-    therefore the first named column after the longest run of empty header cells.
-    """
-    longest_start = longest_len = 0
-    run_start = run_len = 0
-    for idx, name in enumerate(headers):
-        if name:
-            run_len = 0
-            continue
-        run_len = run_len + 1 if run_len else 1
-        run_start = idx - run_len + 1
-        if run_len > longest_len:
-            longest_len, longest_start = run_len, run_start
-
-    if longest_len == 0:
-        return 0
-    boundary = longest_start + longest_len
-    while boundary < len(headers) and not headers[boundary]:
-        boundary += 1
-    return boundary
-
-
-def _detect_offset(fields: list[str], date_idx: int, period_idx: int) -> int | None:
-    """Return the offset under which both anchor columns hold the right shape."""
-    for offset in CANDIDATE_OFFSETS:
-        date_at = date_idx - offset
-        period_at = period_idx - offset
-        if not 0 <= date_at < len(fields) or not 0 <= period_at < len(fields):
-            continue
-        if (_DATE.fullmatch(fields[date_at].strip())
-                and _PERIOD.fullmatch(fields[period_at].strip())):
-            return offset
-    return None
-
-
-def _continuation_is_plausible(extra: dict[str, str]) -> bool:
-    """
-    Reject a continuation line whose single-character flag columns hold wide values.
-
-    In the measured 25,049-row export, 3 rows had a shifted continuation line, which put
-    25 characters of text into TFB - a CHAR(1) column in the target table. Loading that
-    would fail the whole batch on a length check, so for those rows the continuation
-    columns are dropped and counted instead. It costs six minor columns (TilbF-Ref.,
-    TilbF-Org., TbF, TFB, User Name, Valoerdato) on 0.01% of rows; the main line, which
-    carries the business key and every amount and date, is unaffected.
-    """
-    return all(len(extra.get(name, '')) <= SUB_FLAG_MAX_LENGTH
-               for name in SUB_FLAG_COLUMNS)
-
-
-def _field(fields: list[str], header_idx: int, offset: int, shift_from: int) -> str:
-    """Read one column, applying the row's offset only past the shift boundary."""
-    idx = header_idx if header_idx < shift_from else header_idx - offset
-    return fields[idx].strip() if 0 <= idx < len(fields) else ''
+    return bool(_DIGITS.fullmatch(fields[bilag_idx]))
