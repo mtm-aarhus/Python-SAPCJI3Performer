@@ -27,6 +27,7 @@ def handle_error(message: str, error: Exception, queue_element: QueueElement | N
     """
     raw_msg = f"{message}: {repr(error)}\n\nTrace:\n{traceback.format_exc()}"
     error_msg = f"{raw_msg[:497]}\n...\n{raw_msg[-497:]}" if len(raw_msg) > 999 else raw_msg
+    error_email = orchestrator_connection.get_constant(config.ERROR_EMAIL).value
 
     orchestrator_connection.log_error(error_msg)
     if queue_element:
