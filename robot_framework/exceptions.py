@@ -25,8 +25,8 @@ def handle_error(message: str, error: Exception, queue_element: QueueElement | N
         queue_element: The queue element to fail, if any.
         orchestrator_connection: A connection to OpenOrchestrator.
     """
-    error_msg = f"{message}: {repr(error)}\n\nTrace:\n{traceback.format_exc()}"
-    error_email = orchestrator_connection.get_constant(config.ERROR_EMAIL).value
+    raw_msg = f"{message}: {repr(error)}\n\nTrace:\n{traceback.format_exc()}"
+    error_msg = f"{raw_msg[:497]}\n...\n{raw_msg[-497:]}" if len(raw_msg) > 999 else raw_msg
 
     orchestrator_connection.log_error(error_msg)
     if queue_element:
