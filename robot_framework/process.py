@@ -57,6 +57,32 @@ def process(orchestrator_connection: OrchestratorConnection, queue_element: Queu
             "converted to date/number. Check the spool column layout."
         )
 
+    delete_export(orchestrator_connection, file_path)
+
+
+def delete_export(orchestrator_connection, file_path: str) -> None:
+    """
+    Remove the exported file once its rows are safely committed.
+
+    Only after load_spool_file has returned, which is after its COMMIT - so the file is
+    never removed on the strength of a load that later rolled back.
+
+    Worth doing: these run 9-39 MB each and SAP writes them to the user's Documents
+    folder, so a full backfill would otherwise leave a couple of gigabytes behind.
+
+    A failure here is logged and ignored. The rows are already in, and a leftover file
+    is untidy rather than wrong - it must never turn a successful load into a failed
+    queue element.
+    """
+    try:
+        os.remove(file_path)
+        orchestrator_connection.log_trace(f"Deleted export {file_path}")
+    except OSError as error:
+        orchestrator_connection.log_info(
+            f"Could not delete the export {file_path}: {error}. The rows loaded fine; "
+            "the file just needs clearing up."
+        )
+
 
 def parse_queue_element(queue_element: QueueElement) -> tuple[str, int | None]:
     """
@@ -219,9 +245,48 @@ def _get_spool_row_numbers(session) -> list[int]:
 
 
 def select_spool_job(session, row: int) -> None:
-    """Set the selection checkbox for the given spool overview row."""
-    checkbox_id = _get_spool_row_checkbox_id(session, row)
-    session.findById(checkbox_id).Selected = True
+    """
+    Select exactly one spool row, clearing every other selection first.
+
+    The clearing is the important half. This robot processes several queue elements per
+    run and the spool overview session survives between them, so a row ticked for one
+    element was still ticked for the next. SAP then exported BOTH spool jobs and reported
+    'Filer arkiveret i directory ...' - plural, and with no filename - instead of
+    'Fil <navn> gemt i directory <sti>'. get_exported_file_path could not parse that, and
+    the ValueError took down the whole run.
+
+    Seen for real: element 2 exported P020000400765.TXT and loaded 32,273 rows, then
+    element 3's export rewrote that same file alongside its own P020000401621.TXT.
+    """
+    target_id = _get_spool_row_checkbox_id(session, row)
+
+    for checkbox_id in _all_spool_checkbox_ids(session):
+        if checkbox_id == target_id:
+            continue
+        try:
+            checkbox = session.findById(checkbox_id)
+            if checkbox.Selected:
+                checkbox.Selected = False
+        except Exception:  # pylint: disable=broad-exception-caught
+            # A row that has scrolled away is not selectable and cannot be exported
+            # either, so it does not matter.
+            continue
+
+    session.findById(target_id).Selected = True
+
+
+def _all_spool_checkbox_ids(session) -> list[str]:
+    """Every row-selection checkbox id currently on the spool overview."""
+    usr = session.findById("wnd[0]/usr")
+    ids = []
+    for index in range(usr.Children.Count):
+        control = usr.Children(index)
+        try:
+            if _SAP_CHECKBOX_ID_PATTERN.search(control.Id):
+                ids.append(control.Id)
+        except Exception:  # pylint: disable=broad-exception-caught
+            continue
+    return ids
 
 
 def _get_spool_row_checkbox_id(session, row: int) -> str:

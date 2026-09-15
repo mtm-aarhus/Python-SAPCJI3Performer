@@ -1,7 +1,19 @@
 """This module contains configuration constants used across the framework"""
 
 # The number of times the robot retries on an error before terminating.
+# Now counts SETUP failures only (reset/initialize): a queue element that fails no
+# longer fails the robot, because that would put the trigger into a failed state and a
+# queue trigger only fires while it is IDLE.
 MAX_RETRY_COUNT = 1
+
+# How many times one queue element is retried before it is marked FAILED and the run
+# moves on. A full reset - SAP relaunch and Opus login - happens between attempts, so
+# this is the recovery path for a wedged or lost SAP session.
+#
+# It does NOT apply to BusinessError, which is raised straight through: a spool job that
+# was never generated would otherwise cost SPOOL_TIMEOUT_S of polling plus a relaunch on
+# every attempt, and no amount of retrying will make it appear.
+QUEUE_ATTEMPTS = 2
 
 # Whether the robot should be marked as failed if MAX_RETRY_COUNT is reached.
 FAIL_ROBOT_ON_TOO_MANY_ERRORS = True
@@ -22,7 +34,7 @@ ERROR_EMAIL = "Error Email"
 QUEUE_NAME = "SAPCJI3"
 
 # The limit on how many queue elements to process
-MAX_TASK_COUNT = 100
+MAX_TASK_COUNT = 5
 
 # ----------------------
 
