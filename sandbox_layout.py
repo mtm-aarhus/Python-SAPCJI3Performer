@@ -622,11 +622,12 @@ def _result_rows(cursor) -> list[dict]:
 
 def verify_schema(conn) -> bool:
     """Confirm the DDL actually created everything, before anything depends on it."""
-    expected_tables = ["CJI3", "CJI3_Loadlog", "CJI3_Stage", "CJI3_Udtraek"]
+    expected_tables = ["CJI3", "CJI3_Dagdaekning", "CJI3_Loadlog", "CJI3_Stage",
+                       "CJI3_Udtraek"]
     expected_procs = ["usp_CJI3_AfslutUdtraek", "usp_CJI3_Merge",
-                      "usp_CJI3_OpdaterVindueliste", "usp_CJI3_ReserverUdtraek",
-                      "usp_CJI3_SeedUdtraek", "usp_CJI3_TilknytSpoolJob"]
-    expected_views = ["vw_CJI3_DageUdenPoster", "vw_CJI3_Fremdrift", "vw_CJI3_Udtraekstatus"]
+                      "usp_CJI3_PlanlaegUdtraek", "usp_CJI3_TilknytSpoolJob"]
+    expected_views = ["vw_CJI3_DageUdenPoster", "vw_CJI3_Fremdrift",
+                      "vw_CJI3_ManglendeDage", "vw_CJI3_Udtraekstatus"]
 
     cursor = conn.cursor()
     cursor.execute("""
@@ -690,16 +691,18 @@ def _declared_cji3_columns() -> set[str]:
     return set(re.findall(r"^\s{8}([A-Za-z][A-Za-z0-9]*)\s+[A-Z]", block, re.M))
 
 
-def opdater_vindueliste(conn) -> dict:
-    cursor = conn.cursor()
-    cursor.execute("{CALL dbo.usp_CJI3_OpdaterVindueliste (?, ?)}", 7, 7)
-    rows = _result_rows(cursor)
-    return rows[0] if rows else {}
+def planlaeg_udtraek(conn, antal_reparation: int = 0) -> list[dict]:
+    """
+    Plan this run's extraction ranges.
 
-
-def reserver_udtraek(conn, antal: int) -> list[dict]:
+    antal_reparation defaults to 0, unlike the dispatcher's 2. The sandbox only
+    carries the FIRST range through the whole pipeline, and every range the planner
+    returns is stamped IGang - so asking for repair chunks here would leave rows
+    sitting in flight until the next real run's stale sweep wrote them off.
+    Raise it only if you actually want to see what the planner picks.
+    """
     cursor = conn.cursor()
-    cursor.execute("{CALL dbo.usp_CJI3_ReserverUdtraek (?)}", antal)
+    cursor.execute("{CALL dbo.usp_CJI3_PlanlaegUdtraek (?, ?)}", 7, antal_reparation)
     return _result_rows(cursor)
 
 
@@ -719,13 +722,13 @@ def afslut_udtraek(conn, udtraek_id: int, status: str, message: str | None) -> N
 
 def run_end_to_end() -> None:
     """
-    Claim a real window, extract it, load it, and report - the whole pipeline minus
+    Plan a real range, extract it, load it, and report - the whole pipeline minus
     the queue hop through the queuer and performer.
 
-    This WRITES to BI_Oekonomi: it claims a window, inserts rows into dbo.CJI3 and
-    closes the window. That is real work the backfill needs done, not throwaway. If
-    anything fails after the claim, the window is handed back as Afventer so the next
-    run retries it rather than leaving it stuck IGang.
+    This WRITES to BI_Oekonomi: it plans a range, inserts rows into dbo.CJI3, closes
+    the dispatch and marks its days covered. That is real work, not throwaway. If
+    anything fails, the dispatch is closed as Fejlet and its days stay unmarked, so
+    the next real run simply plans them again.
     """
     from robot_framework import mssql_load  # pylint: disable=import-outside-toplevel
     from robot_framework.process import (  # pylint: disable=import-outside-toplevel
@@ -753,17 +756,23 @@ def run_end_to_end() -> None:
             raise SystemExit("Schema is not as expected; see the note above.")
 
         log("")
-        log("STEP 2 - work list")
-        summary = opdater_vindueliste(conn)
-        log(f"  OpdaterVindueliste -> {summary}")
-        windows = reserver_udtraek(conn, 1)
+        log("STEP 2 - plan")
+        cursor = conn.cursor()
+        cursor.execute("SELECT FraDato, TilDato, Dage FROM dbo.vw_CJI3_ManglendeDage "
+                       "ORDER BY FraDato")
+        huller = _result_rows(cursor)
+        log(f"  days never loaded: {huller if huller else 'none'}")
+
+        windows = planlaeg_udtraek(conn)
         if not windows:
-            log("  nothing pending; nothing to do.")
-            return
+            raise SystemExit(
+                "PlanlaegUdtraek returned nothing. It always returns the rolling "
+                "daily range, so the procedure in the database is not the one this "
+                "script expects."
+            )
         window = windows[0]
-        log(f"  claimed window {window['UdtraekId']}: "
-            f"{window['DatoFraSAP']} - {window['DatoTilSAP']} "
-            f"(forsoeg {window['Forsoeg']}, koersler {window['AntalKoersler']})")
+        log(f"  planned udtraek {window['UdtraekId']} ({window['Slags']}): "
+            f"{window['DatoFraSAP']} - {window['DatoTilSAP']}")
 
         log("")
         log("STEP 3 - SAP")
@@ -836,11 +845,12 @@ def run_end_to_end() -> None:
         log(f"FAILED: {type(error).__name__}: {error}")
         if window is not None:
             try:
-                afslut_udtraek(conn, window["UdtraekId"], "Afventer",
+                afslut_udtraek(conn, window["UdtraekId"], "Fejlet",
                                f"sandbox_layout: {type(error).__name__}: {error}")
-                log(f"  window {window['UdtraekId']} handed back as Afventer")
+                log(f"  udtraek {window['UdtraekId']} closed as Fejlet - its days stay "
+                    "unmarked, so the next run plans them again")
             except Exception as release_error:  # pylint: disable=broad-exception-caught
-                log(f"  could not hand the window back: {release_error}")
+                log(f"  could not close the udtraek: {release_error}")
         raise
     finally:
         conn.close()

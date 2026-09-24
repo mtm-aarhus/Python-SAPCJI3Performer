@@ -125,10 +125,11 @@ def wait_for_spool_job(session, job_name: str, timeout_s: int | None = None, pol
     Raises BusinessError rather than TimeoutError on giving up. That is deliberate:
     queue_framework only keeps the queue loop alive for BusinessError, so a
     TimeoutError here would abandon every remaining queue element in the run - and
-    when the dispatcher has queued ten windows for the night, one slow spool job
-    would cost the other nine. The window itself is not lost: it stays IGang in
-    dbo.CJI3_Udtraek until the stale sweep in usp_CJI3_ReserverUdtraek
-    puts it back to Afventer, and the next dispatcher run submits it again.
+    when the dispatcher has queued several ranges for the night, one slow spool job
+    would cost all the others. The data itself is not lost: the dispatch stays IGang
+    in dbo.CJI3_Udtraek until a later run writes it off, and because it never
+    completed, its days were never marked in dbo.CJI3_Dagdaekning - so the planner
+    schedules them again by itself.
     """
     timeout_s = config.SPOOL_TIMEOUT_S if timeout_s is None else timeout_s
     poll_interval_s = config.SPOOL_POLL_INTERVAL_S if poll_interval_s is None else poll_interval_s
